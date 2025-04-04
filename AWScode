@@ -1,0 +1,69 @@
+
+
+from pathlib import Path
+import pydicom
+import numpy as np
+import cv2
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
+
+import pandas as pd
+import s3fs
+
+# This will use your default AWS credentials
+labels = pd.read_csv('s3://pneumonias/stage_2_train_labels.csv')
+
+labels.head(5)
+
+# Remove duplicate entries
+labels = labels.drop_duplicates("patientId")
+
+from pathlib import Path
+
+
+ROOT_PATH = Path("s3://pneumonias/stage_2_train_images/")
+SAVE_PATH = Path("s3://pneumonias/Processed/")
+
+import matplotlib.pyplot as plt
+
+
+
+
+
+
+import boto3
+import io
+import pydicom
+import matplotlib.pyplot as plt
+
+# S3 setup
+s3 = boto3.client('s3')
+bucket = "pneumonias"
+prefix = "stage_2_train_images/"
+
+c = 0
+fig, axis = plt.subplots(3, 3, figsize=(12, 12))
+
+for i in range(3):
+    for j in range(3):
+        patient_id = labels.patientId.iloc[c]
+        file_key = f"{prefix}{patient_id}.dcm"
+
+        # Read file from S3 into memory
+        obj = s3.get_object(Bucket=bucket, Key=file_key)
+        dcm_bytes = io.BytesIO(obj['Body'].read())
+
+        # Load DICOM file
+        dcm = pydicom.dcmread(dcm_bytes).pixel_array
+
+        label = labels["Target"].iloc[c]
+
+        axis[i][j].imshow(dcm, cmap="bone")
+        axis[i][j].set_title(f"Target: {label}")
+        axis[i][j].axis('off')
+
+        c += 1
+
+plt.tight_layout()
+plt.show()
