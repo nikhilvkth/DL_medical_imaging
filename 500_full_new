@@ -1,0 +1,273 @@
+pip install --upgrade pip
+
+pip install pathlib pydicom matplotlib tqdm opencv-python
+
+pip install torch torchvision torchmetrics pytorch-lightning
+
+from pathlib import Path
+import pydicom
+import numpy as np
+import cv2
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm.notebook import tqdm
+
+import torch
+import torchvision
+from torchvision import transforms
+import torchmetrics
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from tqdm.notebook import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+labels = pd.read_csv("/Users/nikhilvalsankulangareth/Downloads/stage_2_train_labels.csv")
+labels=labels.head(490)
+
+ROOT_PATH = Path("//Users/nikhilvalsankulangareth/Desktop/train_images/")
+SAVE_PATH = Path("/Users/nikhilvalsankulangareth/Desktop/processed")
+
+fig, axis = plt.subplots(3, 3, figsize=(9, 9))
+c = 0
+
+for i in range(3):
+    for j in range(3):
+        patient_id = labels.patientId.iloc[c]
+        dcm_path = ROOT_PATH / patient_id
+        dcm_path = dcm_path.with_suffix(".dcm")
+        
+        # Use dcmread instead of read_file
+        dcm = pydicom.dcmread(dcm_path).pixel_array
+        
+        label = labels["Target"].iloc[c]
+        
+        axis[i][j].imshow(dcm, cmap="bone")
+        axis[i][j].set_title(f"Target: {label}")
+        axis[i][j].axis('off')  # Optional: turn off axis for a cleaner look
+        c += 1
+
+plt.tight_layout()
+plt.show()
+
+from tqdm import tqdm
+sums = 0
+sums_squared = 0
+
+for c, patient_id in enumerate(tqdm(labels.patientId.astype(str))):
+    dcm_path = ROOT_PATH / patient_id
+    dcm_path = dcm_path.with_suffix(".dcm")
+
+
+    
+    # Read the DICOM file with pydicom and standardize the array
+    dcm = pydicom.dcmread(dcm_path).pixel_array / 255  # Use dcmread instead of read_file
+        
+    # Resize the image; 1024x1024 is large, so we resize to 224x224
+    dcm_array = cv2.resize(dcm, (224, 224)).astype(np.float16)
+    
+    # Retrieve the corresponding label
+    label = labels.Target.iloc[c]
+    
+    # 4/5 train split, 1/5 val split
+    train_or_val = "train" if c < 240 else "val"
+        
+    # Define save path and create directories if necessary
+    current_save_path = SAVE_PATH / train_or_val / str(label)
+    current_save_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save the array in the corresponding directory
+    np.save(current_save_path / patient_id, dcm_array)
+    
+    # Normalize sum of image for statistics calculation
+    normalizer = dcm_array.shape[0] * dcm_array.shape[1]
+    
+    if train_or_val == "train":  # Only use train data to compute dataset statistics
+        sums += np.sum(dcm_array) / normalizer
+        sums_squared += (np.power(dcm_array, 2).sum()) / normalizer
+
+
+
+mean = sums / 24000
+std = np.sqrt(sums_squared / 24000 - (mean**2))
+
+
+print(f"Mean of Dataset: {mean}, STD: {std}")
+
+def load_file(path):
+    return np.load(path).astype(np.float32)
+
+train_transforms = transforms.Compose([
+                                    transforms.ToTensor(),  # Convert numpy array to tensor
+                                    transforms.Normalize(0.0048, 0.0544),  # Use mean and std from preprocessing notebook
+                                    transforms.RandomAffine( # Data Augmentation
+                                        degrees=(-5, 5), translate=(0, 0.05), scale=(0.9, 1.1)),
+                                        transforms.RandomResizedCrop((224, 224), scale=(0.35, 1))
+
+])
+
+val_transforms = transforms.Compose([
+                                    transforms.ToTensor(),  # Convert numpy array to tensor
+                                    transforms.Normalize([0.49], [0.248]),  # Use mean and std from preprocessing notebook
+])
+
+
+
+
+train_dataset = torchvision.datasets.DatasetFolder(
+    "/Users/nikhilvalsankulangareth/Desktop/processed/train",
+    loader=load_file, extensions="npy", transform=train_transforms)
+
+val_dataset = torchvision.datasets.DatasetFolder(
+    "/Users/nikhilvalsankulangareth/Desktop/processed/val/",
+    loader=load_file, extensions="npy", transform=val_transforms)
+
+fig, axis = plt.subplots(2, 2, figsize=(9, 9))
+for i in range(2):
+    for j in range(2):
+        random_index = np.random.randint(0, 200)
+        x_ray, label = train_dataset[random_index]
+        axis[i][j].imshow(x_ray[0], cmap="bone")
+        axis[i][j].set_title(f"Label:{label}")
+
+
+
+batch_size = 64#TODO
+num_workers = 0# TODO
+
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+
+print(f"There are {len(train_dataset)} train images and {len(val_dataset)} val images")
+
+import torch
+import torchvision
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+import torchmetrics
+
+class PneumoniaModel(pl.LightningModule):
+    def __init__(self, weight=1):
+        super().__init__()
+
+        self.model = torchvision.models.resnet18()
+        # Modify input and output layers
+        self.model.conv1 = torch.nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+        self.model.fc = torch.nn.Linear(in_features=512, out_features=1)
+
+        self.loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([weight]))
+        self.train_acc = torchmetrics.classification.BinaryAccuracy()
+        self.val_acc = torchmetrics.classification.BinaryAccuracy()
+
+    def forward(self, data):
+        return self.model(data)
+
+    def training_step(self, batch, batch_idx):
+        x_ray, label = batch
+        label = label.float()
+        pred = self(x_ray)[:, 0]
+        loss = self.loss_fn(pred, label)
+
+        self.log("Train Loss", loss, on_step=True, on_epoch=False)
+        self.log("Step Train Acc", self.train_acc(torch.sigmoid(pred), label.int()), on_step=True, on_epoch=False)
+
+        return loss
+
+    def on_train_epoch_end(self):
+        self.log("Train Acc", self.train_acc.compute(), prog_bar=True)
+        self.train_acc.reset()
+
+    def validation_step(self, batch, batch_idx):
+        x_ray, label = batch
+        label = label.float()
+        pred = self(x_ray)[:, 0]
+        loss = self.loss_fn(pred, label)
+
+        self.log("Val Loss", loss, on_step=True, on_epoch=False)
+        self.log("Step Val Acc", self.val_acc(torch.sigmoid(pred), label.int()), on_step=True, on_epoch=False)
+
+        return loss
+
+    def on_validation_epoch_end(self):
+        self.log("Val Acc", self.val_acc.compute(), prog_bar=True)
+        self.val_acc.reset()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-4)
+
+# Instantiate model
+model = PneumoniaModel()
+
+# Checkpoint callback
+checkpoint_callback = ModelCheckpoint(
+    monitor='Val Acc',
+    save_top_k=10,
+    mode='max'
+)
+
+# Trainer
+trainer = pl.Trainer(
+    accelerator="cpu",  # Change to "gpu" if needed
+    devices=1,
+    logger=TensorBoardLogger(save_dir="./logs"),
+    log_every_n_steps=1,
+    callbacks=[checkpoint_callback],
+    max_epochs=35
+)
+
+# Train the model
+trainer.fit(model, train_loader, val_loader)
+
+
+
+import torch
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# Load the checkpoint from correct path
+model = PneumoniaModel.load_from_checkpoint("/Users/nikhilvalsankulangareth/logs/lightning_logs/version_1/checkpoints/epoch=0-step=4.ckpt")
+
+model.eval()
+model.to(device)
+
+
+
+
+
+
+
+
+
+
+preds = []
+labels = []
+
+with torch.no_grad():
+    for data, label in tqdm(val_dataset):
+        data = data.to(device).float().unsqueeze(0)
+        pred = torch.sigmoid(model(data)[0].cpu())
+        preds.append(pred)
+        labels.append(label)
+preds = torch.tensor(preds)
+labels = torch.tensor(labels).int()
+
+from torchmetrics.classification import Accuracy, Precision, Recall, ConfusionMatrix
+
+# For binary classification
+acc = Accuracy(task="binary")
+precision = Precision(task="binary")
+recall = Recall(task="binary")
+cm = ConfusionMatrix(task="binary")(preds, labels)
+cm_threshed = ConfusionMatrix(task="binary", threshold=0.25)(preds, labels)
+
+print(f"Val Accuracy: {acc}")
+print(f"Val Precision: {precision}")
+print(f"Val Recall: {recall}")
+print(f"Confusion Matrix:\n {cm}")
+print(f"Confusion Matrix 2:\n {cm_threshed}")
+
+
+
